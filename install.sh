@@ -75,6 +75,20 @@ read -p "  Domínio do servidor (ex: telemedicina.com.br): " SERVER_DOMAIN
 read -p "  Porta da aplicação [5000]: " APP_PORT
 APP_PORT=${APP_PORT:-5000}
 
+# Validar domínio (apenas letras, números, pontos e hífens)
+if [ -n "$SERVER_DOMAIN" ]; then
+  if ! echo "$SERVER_DOMAIN" | grep -qP '^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$'; then
+    log_error "Domínio inválido: ${SERVER_DOMAIN}"
+    exit 1
+  fi
+fi
+
+# Validar porta
+if ! [[ "$APP_PORT" =~ ^[0-9]+$ ]] || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
+  log_error "Porta inválida: ${APP_PORT}"
+  exit 1
+fi
+
 echo ""
 log_info "Iniciando instalação..."
 echo ""
@@ -213,7 +227,10 @@ log_ok "Arquivo .env criado"
 
 log_info "Instalando dependências do projeto (pode demorar alguns minutos)..."
 cd "$APP_DIR"
-sudo -u "$APP_USER" npm install --production=false 2>&1 | tail -3
+if ! sudo -u "$APP_USER" npm install --production=false 2>&1; then
+  log_error "Falha ao instalar dependências. Verifique a saída acima."
+  exit 1
+fi
 log_ok "Dependências instaladas"
 
 # ============================================================
@@ -221,7 +238,14 @@ log_ok "Dependências instaladas"
 # ============================================================
 
 log_info "Compilando o projeto..."
-sudo -u "$APP_USER" bash -c "cd $APP_DIR && set -a && source .env && set +a && npm run build" 2>&1 | tail -5
+if ! sudo -u "$APP_USER" bash -c "cd $APP_DIR && set -a && source .env && set +a && npm run build" 2>&1; then
+  log_error "Falha ao compilar o projeto. Verifique a saída acima."
+  exit 1
+fi
+if [ ! -f "$APP_DIR/dist/index.js" ]; then
+  log_error "Arquivo dist/index.js não encontrado após build."
+  exit 1
+fi
 log_ok "Projeto compilado"
 
 # ============================================================
@@ -229,8 +253,16 @@ log_ok "Projeto compilado"
 # ============================================================
 
 log_info "Aplicando schema do banco de dados..."
-sudo -u "$APP_USER" bash -c "cd $APP_DIR && set -a && source .env && set +a && npx drizzle-kit push --force" 2>&1 | tail -5
-log_ok "Schema do banco aplicado"
+if ! sudo -u "$APP_USER" bash -c "cd $APP_DIR && set -a && source .env && set +a && npx drizzle-kit push --force" 2>&1; then
+  log_error "Falha ao aplicar schema do banco. Verifique a conexão com o banco de dados."
+  exit 1
+fi
+
+if ! sudo -u "$APP_USER" bash -c "set -a && source $APP_DIR/.env && set +a && psql \$DATABASE_URL -c 'SELECT 1;'" > /dev/null 2>&1; then
+  log_error "Não foi possível conectar ao banco de dados. Verifique as credenciais."
+  exit 1
+fi
+log_ok "Schema do banco aplicado e conexão verificada"
 
 # ============================================================
 # 12. CONFIGURAR SERVIÇO SYSTEMD
@@ -491,6 +523,22 @@ fi
 # 20. RESUMO DA INSTALAÇÃO
 # ============================================================
 
+# Salvar credenciais em arquivo seguro
+CREDS_FILE="$APP_DIR/.credentials"
+cat > "$CREDS_FILE" << EOF
+# Credenciais do Banco de Dados - Tele<M3D>
+# Gerado em $(date '+%Y-%m-%d %H:%M:%S')
+# MANTENHA ESTE ARQUIVO SEGURO!
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASS=${DB_PASS}
+SESSION_SECRET=${SESSION_SECRET}
+EOF
+chown root:root "$CREDS_FILE"
+chmod 600 "$CREDS_FILE"
+
 echo ""
 echo "============================================================"
 echo -e "  ${GREEN}Instalação concluída com sucesso!${NC}"
@@ -498,7 +546,7 @@ echo "============================================================"
 echo ""
 echo "  Informações do Sistema:"
 echo "  ─────────────────────────────────────────────────"
-echo "  Aplicação:       http://${NGINX_DOMAIN}:${APP_PORT}"
+echo "  Aplicação:       http://${NGINX_DOMAIN}"
 if [ -n "$SERVER_DOMAIN" ] && [ "$SERVER_DOMAIN" != "localhost" ]; then
 echo "  URL Pública:     https://${SERVER_DOMAIN}"
 fi
@@ -507,11 +555,10 @@ echo "  Usuário:         ${APP_USER}"
 echo ""
 echo "  Banco de Dados:"
 echo "  ─────────────────────────────────────────────────"
-echo "  Host:            localhost"
-echo "  Porta:           5432"
+echo "  Host:            localhost:5432"
 echo "  Banco:           ${DB_NAME}"
 echo "  Usuário:         ${DB_USER}"
-echo "  Senha:           ${DB_PASS}"
+echo "  Credenciais:     sudo cat ${CREDS_FILE}"
 echo ""
 echo "  Comandos Úteis:"
 echo "  ─────────────────────────────────────────────────"
@@ -522,10 +569,7 @@ echo "  Logs:            sudo journalctl -u telemedicina -f"
 echo "  Reiniciar:       sudo systemctl restart telemedicina"
 echo "  Parar:           sudo systemctl stop telemedicina"
 echo ""
-echo "  Arquivo .env:    ${ENV_FILE}"
+echo "  Configuração:    ${ENV_FILE}"
 echo "  (Edite para adicionar/alterar chaves de API)"
-echo ""
-echo "  IMPORTANTE: Guarde a senha do banco de dados!"
-echo "  Senha: ${DB_PASS}"
 echo ""
 echo "============================================================"
